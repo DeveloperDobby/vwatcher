@@ -16,26 +16,13 @@
     },
     {
       "id": "vans-example-sk8hi",
-      "enabled": false,
+      "enabled": true,
       "name": "[비교 예시] Vans Sk8-Hi Plaid (VN000Y18BML)",
       "url": "https://www.vans.com/en-us/p/shoes/icons/sk8-hi-5325/sk8-hi-shoe-VN000Y18BML",
       "mode": "availability",
       "render": "browser",
       "expected_sku": "VN000Y18BML",
       "expected_title_contains": "Sk8-Hi Shoe",
-      "wait_selector": "h1",
-      "settle_ms": 1500,
-      "notify_on_first_run": false
-    },
-    {
-      "id": "vans-example-toddler-sk8hi",
-      "enabled": false,
-      "name": "[비교 예시] Toddler Sk8-Hi Side Zip (VN0007Q3BRD)",
-      "url": "https://www.vans.com/en-us/p/shoes/icons/sk8-hi-5325/toddler-sk8-hi-side-zip-shoe-VN0007Q3BRD",
-      "mode": "availability",
-      "render": "browser",
-      "expected_sku": "VN0007Q3BRD",
-      "expected_title_contains": "Toddler Sk8-Hi Side Zip Shoe",
       "wait_selector": "h1",
       "settle_ms": 1500,
       "notify_on_first_run": false
