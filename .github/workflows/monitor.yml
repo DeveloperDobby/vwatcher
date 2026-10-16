@@ -1,55 +1,75 @@
-name: Vans Release Watch → Discord
+name: Vans Release Watch → Discord (60s loop)
 
 on:
+  # KCA-main.zip의 auto-notify.yml과 같은 3시간 교대 방식
   schedule:
-    # 5분 간격 (GitHub 예약 실행은 지연/누락될 수 있습니다.)
-    - cron: "2-57/5 * * * *"
+    - cron: "51 2-23/3 * * *"
   workflow_dispatch:
 
+# 이전 실행 취소(actions:write) + 상태 저장(contents:write)
 permissions:
-  contents: write  # 이전 감시 이력을 state/monitor_state.json에 저장
+  contents: write
+  actions: write
 
-concurrency:
-  group: pagewatch-state
-  cancel-in-progress: false
+# 의도적으로 concurrency 그룹을 두지 않음:
+# 새 실행이 시작되어야 이전 실행을 취소할 수 있습니다.
 
 jobs:
-  monitor:
+  launch:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 359
     steps:
-      - uses: actions/checkout@v4
+      - name: Cancel previously running workflow runs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          CURRENT_RUN_ID: ${{ github.run_id }}
+          WORKFLOW_FILE: monitor.yml
+        run: |
+          set -euo pipefail
+          for status in queued in_progress; do
+            gh run list \
+              --repo "${GH_REPO}" \
+              --workflow "${WORKFLOW_FILE}" \
+              --status "${status}" \
+              --limit 50 \
+              --json databaseId \
+              --jq '.[].databaseId' | while read -r run_id; do
+                if [ -z "${run_id}" ] || [ "${run_id}" = "${CURRENT_RUN_ID}" ]; then
+                  continue
+                fi
+                echo "Canceling older ${status} run: ${run_id}"
+                gh run cancel "${run_id}" --repo "${GH_REPO}" || true
+              done
+          done
+
+      - name: Checkout
+        uses: actions/checkout@v4
         with:
           persist-credentials: true
-          fetch-depth: 1
+          fetch-depth: 0
 
-      - uses: actions/setup-python@v5
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
 
-      - name: Install packages
+      - name: Install dependencies
         run: python -m pip install --quiet -r requirements.txt
 
-      - name: Install Chromium only when needed
+      - name: Install browser when needed
         run: |
           if python -c 'import json,sys; c=json.load(open("config/monitors.json")); sys.exit(0 if any(m.get("enabled") and m.get("render", "http")=="browser" for m in c.get("monitors", [])) else 1)'; then
             python -m playwright install --with-deps chromium
           fi
 
-      - name: Detect Vans purchase availability
+      - name: Monitor Vans every 60 seconds within one Actions run
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
-        run: python monitor.py
-
-      - name: Save seen items between workflow runs
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -- state/monitor_state.json
-          if ! git diff --cached --quiet; then
-            git commit -m "chore: update private pagewatch baseline [skip ci]"
-            git push
-          fi
+          CHECK_INTERVAL_SECONDS: "60"
+          RUN_DURATION_SECONDS: "21480"
+          GITHUB_REF_NAME: ${{ github.ref_name }}
+          PYTHONUNBUFFERED: "1"
+        run: python monitor.py --loop --git-sync
