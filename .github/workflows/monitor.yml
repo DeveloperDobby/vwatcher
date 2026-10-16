@@ -1,0 +1,55 @@
+name: Vans Release Watch → Discord
+
+on:
+  schedule:
+    # 5분 간격 (GitHub 예약 실행은 지연/누락될 수 있습니다.)
+    - cron: "2-57/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write  # 이전 감시 이력을 state/monitor_state.json에 저장
+
+concurrency:
+  group: pagewatch-state
+  cancel-in-progress: false
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+          fetch-depth: 1
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install packages
+        run: python -m pip install --quiet -r requirements.txt
+
+      - name: Install Chromium only when needed
+        run: |
+          if python -c 'import json,sys; c=json.load(open("config/monitors.json")); sys.exit(0 if any(m.get("enabled") and m.get("render", "http")=="browser" for m in c.get("monitors", [])) else 1)'; then
+            python -m playwright install --with-deps chromium
+          fi
+
+      - name: Detect Vans purchase availability
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+        run: python monitor.py
+
+      - name: Save seen items between workflow runs
+        if: always()
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- state/monitor_state.json
+          if ! git diff --cached --quiet; then
+            git commit -m "chore: update private pagewatch baseline [skip ci]"
+            git push
+          fi
