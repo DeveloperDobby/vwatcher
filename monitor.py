@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import re
+import subprocess
 import sys
 import time
 import unicodedata
@@ -544,12 +545,126 @@ def run(config_path: Path, state_path: Path, *, dry_run: bool = False) -> int:
     return 1 if errors else 0
 
 
+
+def git_checkpoint(state_path: Path) -> bool:
+    """Commit and push monitor state immediately after a change, across workflow runs.
+
+    Designed for a GitHub Actions checkout with contents:write and
+    persist-credentials:true. A failed push raises so next loop retries.
+    """
+    if not Path(".git").exists():
+        raise RuntimeError("git state sync는 GitHub Actions checkout에서만 사용할 수 있습니다")
+    try:
+        repo_path = str(state_path.resolve().relative_to(Path.cwd().resolve()))
+    except ValueError as exc:
+        raise ValueError("state 파일은 저장소 내부에 있어야 합니다") from exc
+    branch = os.environ.get("GITHUB_REF_NAME", "").strip()
+    if not branch or not re.fullmatch(r"[A-Za-z0-9._/-]{1,180}", branch) or branch.startswith("-"):
+        raise ValueError("GITHUB_REF_NAME에 유효한 브랜치 이름이 필요합니다")
+
+    def git(*args: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["git", *args], text=True, capture_output=True, check=True,
+                              timeout=45)
+
+    # Commit only actual state changes, but also retry previously failed pushes.
+    changed = git("status", "--porcelain", "--", repo_path).stdout.strip()
+    if changed:
+        git("add", "--", repo_path)
+        staged = subprocess.run(["git", "diff", "--cached", "--quiet", "--", repo_path])
+        if staged.returncode not in (0, 1):
+            raise RuntimeError("git diff 실패")
+        if staged.returncode == 1:
+            git("-c", "user.name=github-actions[bot]",
+                "-c", "user.email=41898282+github-actions[bot]@users.noreply.github.com",
+                "commit", "-m", "chore: save monitor state [skip ci]", "--", repo_path)
+
+    # git pull and push only when there are local commits to upload.
+    ahead = git("rev-list", "--count", "HEAD", "--not", f"origin/{branch}").stdout.strip()
+    if int(ahead or "0") == 0:
+        return bool(changed)
+    git("pull", "--rebase", "origin", branch)
+    git("push", "origin", f"HEAD:refs/heads/{branch}")
+    print("[STATE] 감시 상태를 GitHub 저장소에 저장했습니다.", flush=True)
+    return True
+
+
+def run_loop(
+    config_path: Path,
+    state_path: Path,
+    *,
+    interval_seconds: int,
+    duration_seconds: int,
+    git_sync: bool = False,
+    dry_run: bool = False,
+    check=None,
+    checkpoint=None,
+    clock=None,
+    sleep=None,
+) -> int:
+    """One long-running job; checks every ~interval_seconds until its deadline.
+
+    Unlike the reference KCA in-memory baseline, this stores state on disk and
+    optionally pushes changed state, retaining alerts across job replacements.
+    Test seams permit simulated time and requests without hitting external sites.
+    """
+    if interval_seconds < 1 or duration_seconds < 1:
+        raise ValueError("감시 주기/실행 시간은 양수여야 합니다")
+    if git_sync and dry_run:
+        raise ValueError("--dry-run 및 --git-sync는 함께 사용할 수 없습니다")
+    clock = clock or time.monotonic
+    sleep = sleep or time.sleep
+    check = check or (lambda: run(config_path, state_path, dry_run=dry_run))
+    checkpoint = checkpoint or (lambda: git_checkpoint(state_path))
+    started = clock()
+    deadline = started + duration_seconds
+    iteration = failures = successes = 0
+    print(f"[LOOP] 감시 시작: {interval_seconds}초 간격, 최대 {duration_seconds}초, "
+          f"Git 동기화={'사용' if git_sync else '미사용'}", flush=True)
+    while clock() < deadline:
+        iteration += 1
+        tick_start = clock()
+        try:
+            status = check()
+            if status == 0:
+                successes += 1
+            else:
+                failures += 1
+                print(f"[LOOP] #{iteration} 일부 감시 오류(코드 {status}) — 다음 주기 재시도", flush=True)
+        except Exception as exc:
+            failures += 1
+            print(f"[LOOP] #{iteration} 감시 오류: {type(exc).__name__}: {str(exc)[:180]}",
+                  file=sys.stderr, flush=True)
+        # Push state even after partial monitor errors: other monitors may have succeeded.
+        if git_sync:
+            try:
+                checkpoint()
+            except Exception as exc:
+                # subprocess output intentionally omitted; avoid logging access tokens.
+                print(f"[STATE] 저장소 동기화 실패 ({type(exc).__name__}). 다음 주기에 재시도합니다.",
+                      file=sys.stderr, flush=True)
+        remaining = deadline - clock()
+        if remaining <= 0:
+            break
+        next_tick = tick_start + interval_seconds
+        pause = min(remaining, max(0.0, next_tick - clock()))
+        if pause > 0:
+            sleep(pause)
+    print(f"[LOOP] 종료: 확인 {iteration}회, 성공 {successes}회, 오류 {failures}회", flush=True)
+    return 0 if successes else 1
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="개인용 쪽감시자 — 새 상품/웹페이지 변경 Discord 알림")
     parser.add_argument("--config", default="config/monitors.json")
     parser.add_argument("--state", default="state/monitor_state.json")
     parser.add_argument("--dry-run", action="store_true", help="전송/저장하지 않고 확인만 함")
     parser.add_argument("--test-webhook", action="store_true", help="Discord 웹훅 연결 점검")
+    parser.add_argument("--loop", action="store_true", help="GitHub Actions 실행 중 반복 감시")
+    parser.add_argument("--git-sync", action="store_true", help="상태 변경 즉시 GitHub에 커밋/푸시(Actions 전용)")
+    parser.add_argument("--interval-seconds", type=int,
+                        default=int(os.getenv("CHECK_INTERVAL_SECONDS", "60")))
+    parser.add_argument("--duration-seconds", type=int,
+                        default=int(os.getenv("RUN_DURATION_SECONDS", "21480")))
     args = parser.parse_args()
     if args.test_webhook:
         _discord_url()
@@ -557,6 +672,11 @@ def main() -> int:
         send_discord(m, [{"kind": "region", "selector": "테스트", "before": "", "after": "알림 수신 성공"}])
         print("Discord 연결 테스트를 전송했습니다.")
         return 0
+    if args.loop:
+        return run_loop(Path(args.config), Path(args.state),
+                        interval_seconds=args.interval_seconds,
+                        duration_seconds=args.duration_seconds,
+                        git_sync=args.git_sync, dry_run=args.dry_run)
     return run(Path(args.config), Path(args.state), dry_run=args.dry_run)
 
 
