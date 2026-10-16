@@ -16,7 +16,7 @@
     },
     {
       "id": "vans-example-sk8hi",
-      "enabled": false,
+      "enabled": true,
       "name": "[비교 예시] Vans Sk8-Hi Plaid (VN000Y18BML)",
       "url": "https://www.vans.com/en-us/p/shoes/icons/sk8-hi-5325/sk8-hi-shoe-VN000Y18BML",
       "mode": "availability",
