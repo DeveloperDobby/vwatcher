@@ -30,6 +30,28 @@ CAPTCHA_PHRASES = (
 MAX_SEEN = 10000
 MAX_ITEMS = 500
 
+# 도메인에서 403/429를 돌려주면 동일 환경에서 매분 재시도하지 않는다.
+# 프로세스 동안만 기억하며, 재실행 시 첫 요청부터 다시 확인한다.
+_SITE_BLOCKED_UNTIL: dict[str, float] = {}
+
+
+class SiteAccessDenied(RuntimeError):
+    """쇼핑몰에서 요청을 거절한 경우(상태 403/429). Discord 오류와 구분."""
+
+    def __init__(self, url: str, status: int):
+        self.status = status
+        self.host = urlsplit(url).hostname or "unknown"
+        super().__init__(f"HTTP {status}: {self.host} 사이트가 자동 요청을 거부했습니다")
+
+
+def _block_backoff_seconds() -> int:
+    """403/429 뒤 도메인별 재시도 대기(기본 15분, 최소 1분, 최대 1시간)."""
+    raw = os.getenv("SITE_BLOCK_BACKOFF_SECONDS", "900")
+    try:
+        return min(3600, max(60, int(raw)))
+    except ValueError:
+        return 900
+
 # 판매 버튼은 반드시 상품 상세 영역 안에 있어야 한다. 전역 메뉴 및 추천상품 오탐 방지.
 ADD_TO_CART = re.compile(r"\badd\s+to\s+(?:bag|cart)\b", re.I)
 COMING_SOON = re.compile(r"\bcoming\s+soon\b", re.I)
@@ -289,6 +311,8 @@ def fetch_html(m: dict, browser=None) -> str:
     url = m["url"]
     if m.get("render", "http") == "http":
         resp = requests.get(url, timeout=25, headers={"User-Agent": "PageWatch/1.0 (read-only personal monitor)"})
+        if resp.status_code in (403, 429):
+            raise SiteAccessDenied(url, resp.status_code)
         resp.raise_for_status()
         html = resp.text
     else:
@@ -298,6 +322,8 @@ def fetch_html(m: dict, browser=None) -> str:
         try:
             page = context.new_page()
             response = page.goto(url, wait_until="domcontentloaded", timeout=35000)
+            if response is not None and response.status in (403, 429):
+                raise SiteAccessDenied(url, response.status)
             if response is not None and response.status >= 400:
                 raise RuntimeError(f"HTTP {response.status}")
             selector = m.get("wait_selector") or (m.get("item_selector") if m.get("mode", "items") == "items"
@@ -494,11 +520,15 @@ def run(config_path: Path, state_path: Path, *, dry_run: bool = False) -> int:
         validate_monitor(m)
     state = load_state(state_path)
     errors = 0
-    counts = {"events": 0, "pages": 0}
+    counts = {"events": 0, "pages": 0, "paused": 0}
 
     def check_all(browser=None):
         nonlocal errors
         for m in active:
+            host = urlsplit(m["url"]).hostname or ""
+            if time.monotonic() < _SITE_BLOCKED_UNTIL.get(host, 0):
+                counts["paused"] += 1
+                continue
             try:
                 html = fetch_html(m, browser)
                 previous = state["monitors"].get(m["id"])
@@ -514,6 +544,14 @@ def run(config_path: Path, state_path: Path, *, dry_run: bool = False) -> int:
                            else f"{current.get('last_count',len(current.get('regions', [])))}개 확인")
                 print(f"[OK] {m['id']}: {summary} / 새 알림 {len(events)}건"
                       + (" (dry run, 미전송)" if dry_run else ""))
+            except SiteAccessDenied as exc:
+                errors += 1
+                backoff = _block_backoff_seconds()
+                _SITE_BLOCKED_UNTIL[host] = time.monotonic() + backoff
+                print(f"[BLOCKED] {m['id']}: HTTP {exc.status}, {host} 접속 거부. "
+                      f"같은 도메인 재요청을 {backoff}초 중단합니다. "
+                      "다른 실행 환경/허용된 공식 접근 방법을 확인하세요.",
+                      file=sys.stderr, flush=True)
             except Exception as exc:
                 errors += 1
                 # 특히 웹훅 토큰은 네트워크 예외 메시지에 섞일 수 있으므로 로그에서 제거.
@@ -541,8 +579,10 @@ def run(config_path: Path, state_path: Path, *, dry_run: bool = False) -> int:
             return 1
     else:
         check_all()
-    print(f"총 {counts['pages']}개 페이지 확인, {counts['events']}건 감지, 실패 {errors}개")
-    return 1 if errors else 0
+    print(f"총 {counts['pages']}개 페이지 확인, {counts['events']}건 감지, "
+          f"실패 {errors}개, 접근차단 대기 {counts['paused']}개")
+    # 대기 상태를 성공으로 취급하지 않는다. 알림 감시가 정상 작동 중이라는 착각을 방지.
+    return 1 if errors or counts["paused"] else 0
 
 
 
@@ -653,12 +693,88 @@ def run_loop(
     return 0 if successes else 1
 
 
+
+
+def _inventory_schema(value, depth: int = 0):
+    """Summarize a public JSON structure without echoing arbitrary response values."""
+    if isinstance(value, dict):
+        if depth >= 3:
+            return {"type": "object", "key_count": len(value)}
+        return {str(k)[:70]: _inventory_schema(v, depth + 1)
+                for k, v in list(value.items())[:20]}
+    if isinstance(value, list):
+        return {"type": "array", "length": len(value),
+                "first_item": _inventory_schema(value[0], depth + 1) if value else None}
+    return type(value).__name__
+
+
+def probe_vans_inventory(config_path: Path) -> int:
+    """Test public Vans inventory endpoints; not an inventory availability parser.
+
+    Both /api and /napi paths have appeared on publicly indexed Vans product
+    pages. This read-only diagnostic checks status, content type, and JSON shape.
+    403/429 are access-denied outcomes, never 'out of stock'.
+    """
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    monitors = config.get("monitors", [])
+    if not isinstance(monitors, list):
+        raise ValueError("config의 monitors는 배열이어야 합니다")
+    unique_skus = []
+    for m in monitors:
+        if not isinstance(m, dict):
+            continue
+        sku = str(m.get("expected_sku", "")).strip().upper()
+        # Probe example monitors even when disabled, to compare status outcomes.
+        if re.fullmatch(r"[A-Z0-9]{6,30}", sku) and sku not in unique_skus:
+            unique_skus.append(sku)
+    if not unique_skus:
+        print("[API-PROBE] config/monitors.json에 유효한 expected_sku가 없습니다.")
+        return 2
+
+    success = 0
+    for sku in unique_skus:
+        for prefix in ("api", "napi"):
+            endpoint = (f"https://www.vans.com/{prefix}/products/v2/products/"
+                        f"{sku}/inventory?locale=en-us")
+            try:
+                response = requests.get(
+                    endpoint,
+                    headers={"Accept": "application/json",
+                             "User-Agent": "Personal-Vans-Monitor/1.0 (read-only inventory probe)"},
+                    timeout=15, allow_redirects=False)
+                status = response.status_code
+                content_type = response.headers.get("content-type", "unknown")[:100]
+                print(f"[API-PROBE] {sku} /{prefix}/: HTTP {status} | {content_type}", flush=True)
+                if status == 200:
+                    try:
+                        data = response.json()
+                    except ValueError:
+                        print("[API-PROBE] HTTP 200이지만 유효한 JSON이 아닙니다.")
+                        continue
+                    success += 1
+                    print("[API-PROBE] JSON 구조(값 제외): " +
+                          json.dumps(_inventory_schema(data), ensure_ascii=False)[:3000], flush=True)
+                    print("[API-PROBE] JSON 200 = 데이터 접근 가능일 뿐, 구매 가능 증거는 아닙니다.")
+                elif status in (403, 429):
+                    print("[API-PROBE] 접근 거부/요청 제한; 품절로 판정하지 않습니다.")
+                elif status in (301, 302, 303, 307, 308):
+                    # No automatic redirects so an untrusted Location is not followed.
+                    print("[API-PROBE] 리디렉션; 자동 이동하지 않습니다.")
+            except requests.RequestException as exc:
+                # Never print response body / cookies / Authorization.
+                print(f"[API-PROBE] {sku} /{prefix}/: 요청 실패 ({type(exc).__name__})", flush=True)
+    print(f"[API-PROBE] 완료: {len(unique_skus)}개 SKU, 접근 가능한 JSON 경로 {success}개.")
+    # A diagnostic should finish successfully even if the site denies every probe.
+    return 0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="개인용 쪽감시자 — 새 상품/웹페이지 변경 Discord 알림")
     parser.add_argument("--config", default="config/monitors.json")
     parser.add_argument("--state", default="state/monitor_state.json")
     parser.add_argument("--dry-run", action="store_true", help="전송/저장하지 않고 확인만 함")
     parser.add_argument("--test-webhook", action="store_true", help="Discord 웹훅 연결 점검")
+    parser.add_argument("--probe-inventory", action="store_true", help="Vans 공개 재고 API 후보 경로 접근 진단(알림/상태변경 없음)")
     parser.add_argument("--loop", action="store_true", help="GitHub Actions 실행 중 반복 감시")
     parser.add_argument("--git-sync", action="store_true", help="상태 변경 즉시 GitHub에 커밋/푸시(Actions 전용)")
     parser.add_argument("--interval-seconds", type=int,
@@ -666,6 +782,8 @@ def main() -> int:
     parser.add_argument("--duration-seconds", type=int,
                         default=int(os.getenv("RUN_DURATION_SECONDS", "21480")))
     args = parser.parse_args()
+    if args.probe_inventory:
+        return probe_vans_inventory(Path(args.config))
     if args.test_webhook:
         _discord_url()
         m = {"id": "test", "name": "쪽감시자 연결 테스트", "url": "https://example.com", "notify_limit": 1}
