@@ -1,25 +1,30 @@
-name: Vans Release Watch → Discord (60s loop)
+name: Vans Inventory Probe + 60s Discord Monitor
 
 on:
-  # KCA-main.zip의 auto-notify.yml과 같은 3시간 교대 방식
+  # 기존 KCA 방식: 약 3시간마다 새로운 실행을 시작합니다.
   schedule:
     - cron: "51 2-23/3 * * *"
   workflow_dispatch:
+    inputs:
+      probe_only:
+        description: "재고 API 접근만 검사하고 종료 (일반 감시 생략)"
+        type: boolean
+        default: false
+        required: false
 
-# 이전 실행 취소(actions:write) + 상태 저장(contents:write)
 permissions:
   contents: write
   actions: write
 
-# 의도적으로 concurrency 그룹을 두지 않음:
-# 새 실행이 시작되어야 이전 실행을 취소할 수 있습니다.
-
 jobs:
   launch:
+    # GitHub에서 제공하는 호스팅 러너만 사용합니다.
     runs-on: ubuntu-latest
     timeout-minutes: 359
     steps:
-      - name: Cancel previously running workflow runs
+      # API 진단을 수동으로 실행하면 진행 중인 감시는 취소하지 않습니다.
+      - name: Cancel older normal monitoring runs
+        if: ${{ inputs.probe_only != true }}
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -33,12 +38,12 @@ jobs:
               --workflow "${WORKFLOW_FILE}" \
               --status "${status}" \
               --limit 50 \
-              --json databaseId \
-              --jq '.[].databaseId' | while read -r run_id; do
+              --json databaseId,event \
+              --jq '.[] | select(.event == "schedule") | .databaseId' | while read -r run_id; do
                 if [ -z "${run_id}" ] || [ "${run_id}" = "${CURRENT_RUN_ID}" ]; then
                   continue
                 fi
-                echo "Canceling older ${status} run: ${run_id}"
+                echo "Canceling older scheduled run: ${run_id}"
                 gh run cancel "${run_id}" --repo "${GH_REPO}" || true
               done
           done
@@ -58,21 +63,27 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --quiet -r requirements.txt
 
-      - name: Install browser & virtual display (Xvfb) when needed
+      # GitHub Actions -> Run workflow -> probe_only=true 에서만 수행.
+      # HTTP 403/429가 나오면 재고 없음이 아니라 GitHub에서 접근 거부된 것입니다.
+      - name: Diagnose Vans inventory API (api + napi)
+        if: ${{ inputs.probe_only == true }}
+        run: python monitor.py --probe-inventory
+
+      - name: Install browser when needed
+        if: ${{ inputs.probe_only != true }}
         run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq xvfb
           if python -c 'import json,sys; c=json.load(open("config/monitors.json")); sys.exit(0 if any(m.get("enabled") and m.get("render", "http")=="browser" for m in c.get("monitors", [])) else 1)'; then
-            python -m playwright install --with-deps chromium chrome || python -m playwright install --with-deps chromium
+            python -m playwright install --with-deps chromium
           fi
 
       - name: Monitor Vans every 60 seconds within one Actions run
+        if: ${{ inputs.probe_only != true }}
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
-          PROXY_URL: ${{ secrets.PROXY_URL }}
           CHECK_INTERVAL_SECONDS: "60"
+          SITE_BLOCK_BACKOFF_SECONDS: "900"
           RUN_DURATION_SECONDS: "21480"
           GITHUB_REF_NAME: ${{ github.ref_name }}
           PYTHONUNBUFFERED: "1"
-        run: xvfb-run --auto-servernum --server-args="-screen 0 1440x900x24" python monitor.py --loop --git-sync
+        run: python monitor.py --loop --git-sync
