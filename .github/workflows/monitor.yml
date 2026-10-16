@@ -58,18 +58,21 @@ jobs:
       - name: Install dependencies
         run: python -m pip install --quiet -r requirements.txt
 
-      - name: Install browser when needed
+      - name: Install browser & virtual display (Xvfb) when needed
         run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq xvfb
           if python -c 'import json,sys; c=json.load(open("config/monitors.json")); sys.exit(0 if any(m.get("enabled") and m.get("render", "http")=="browser" for m in c.get("monitors", [])) else 1)'; then
-            python -m playwright install --with-deps chromium
+            python -m playwright install --with-deps chromium chrome || python -m playwright install --with-deps chromium
           fi
 
       - name: Monitor Vans every 60 seconds within one Actions run
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+          PROXY_URL: ${{ secrets.PROXY_URL }}
           CHECK_INTERVAL_SECONDS: "60"
           RUN_DURATION_SECONDS: "21480"
           GITHUB_REF_NAME: ${{ github.ref_name }}
           PYTHONUNBUFFERED: "1"
-        run: python monitor.py --loop --git-sync
+        run: xvfb-run --auto-servernum --server-args="-screen 0 1440x900x24" python monitor.py --loop --git-sync
