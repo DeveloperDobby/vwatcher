@@ -28,6 +28,45 @@
       "notify_on_first_run": false
     },
     {
+      "id": "vans-otw-satoshi-era95-navy-uk",
+      "enabled": true,
+      "name": "Vans x Satoshi Era 95 Gems (VN00114ESN0) 영국",
+      "url": "https://www.vans.com/en-gb/p/otw-by-vans-x-satoshi-nakamoto-era-95-shoes-VN00114ESN0",
+      "mode": "availability",
+      "render": "browser",
+      "expected_sku": "VN00114ESN0",
+      "expected_title_contains": "Satoshi Nakamoto Era 95 Shoes",
+      "wait_selector": "h1",
+      "settle_ms": 1500,
+      "notify_on_first_run": false
+    },
+    {
+      "id": "vans-otw-satoshi-era95-navy-nr",
+      "enabled": true,
+      "name": "Vans x Satoshi Era 95 Gems (VN00114ESN0) 네덜란드",
+      "url": "https://www.vans.com/nl-nl/p/otw-by-vans-x-satoshi-nakamoto-era-95-schoenen-VN00114ESN0",
+      "mode": "availability",
+      "render": "browser",
+      "expected_sku": "VN00114ESN0",
+      "expected_title_contains": "Satoshi Nakamoto Era 95 Schoenen",
+      "wait_selector": "h1",
+      "settle_ms": 1500,
+      "notify_on_first_run": false
+    },
+    {
+      "id": "vans-otw-satoshi-era95-navy-fr",
+      "enabled": true,
+      "name": "Vans x Satoshi Era 95 Gems (VN00114ESN0) 프랑스",
+      "url": "https://www.vans.com/fr-fr/p/chaussures-otw-by-vans-x-satoshi-nakamoto-era-95-VN00114ESN0",
+      "mode": "availability",
+      "render": "browser",
+      "expected_sku": "VN00114ESN0",
+      "expected_title_contains": "Satoshi Nakamoto Era 95",
+      "wait_selector": "h1",
+      "settle_ms": 1500,
+      "notify_on_first_run": false
+    },
+    {
       "id": "vans-example-toddler-sk8hi",
       "enabled": false,
       "name": "[비교 예시] Toddler Sk8-Hi Side Zip (VN0007Q3BRD)",
